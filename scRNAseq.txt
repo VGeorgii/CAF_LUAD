@@ -1,0 +1,435 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import glob
+from pathlib import Path
+from matplotlib.pyplot import rc_context
+import scanpy as sc
+from scipy import stats
+import anndata as ad
+
+# if IN_COLAB:
+#     %matplotlib inline
+%matplotlib inline
+show_plot = True
+
+
+
+# Convenient IPython console
+# comment it if you execute Jupyterlab on a remote server
+# %qtconsole --style monokai
+# and use instead
+%connect_info
+# then jupyter qtconsole --style monokai --existing ./kernel.json
+# or if remote: jupyter qtconsole --style monokai --existing ./kernel.json --ssh alexis@CRCT2112
+
+sc.settings.set_figure_params(dpi=80, facecolor='white')
+
+
+
+
+
+#import and read data
+
+from glob import glob
+# detect all matrix files
+path_raw = list(glob('E:/scRNAseq/scRNA_Seq/processed/count cell ranger/*/'))
+path_samples =  [i + 'filtered_feature_bc_matrix.h5' for i in path_raw]
+results_file = '../data/intermediate/all_samples.h5ad'
+
+adatas = [sc.read_10x_h5(filename, gex_only=False) for filename in path_samples]
+
+adatas
+
+for i, adata in enumerate(adatas):
+    adata.var_names_make_unique()
+    adata.obs['sample'] = sample_names[i]
+
+# concatenate the datasets
+# adata = adatas[0].concatenate(adatas[1:])
+adata = ad.concat(adatas, merge="same")
+# dataset.subsample_genes(4000)
+
+adata.obs_names_make_unique()
+
+
+
+#data normalization and filtering
+
+samples_size = adata.obs['sample'].value_counts().sort_index()
+
+sc.pl.highest_expr_genes(adata, n_top=20, )
+
+sc.pp.filter_cells(adata, min_genes = 250)
+sc.pp.filter_genes(adata, min_cells = 3)
+
+adata.var['mt'] = adata.var_names.str.startswith('MT-')  # annotate the group of mitochondrial genes as 'mt'
+sc.pp.calculate_qc_metrics(adata, qc_vars=['mt'], percent_top=None, log1p=False, inplace=True)
+
+adata.var[adata.var.index == 'FAP']
+
+sc.pl.violin(adata, ['n_genes_by_counts', 'total_counts', 'pct_counts_mt'],
+             jitter=0.4, multi_panel=True)
+
+sc.pl.scatter(adata, x='total_counts', y='pct_counts_mt')
+sc.pl.scatter(adata, x='total_counts', y='n_genes_by_counts')
+
+adata = adata[adata.obs.n_genes_by_counts < 2500, :]
+adata = adata[adata.obs.pct_counts_mt < 17, :]
+
+sc.pp.normalize_total(adata, target_sum=1e4)
+
+adata.X
+
+sc.pp.log1p(adata)
+
+
+
+sc.pp.highly_variable_genes(adata, min_mean = 0.0125, max_mean = 3, min_disp = 0.5)
+
+adata.raw = adata
+
+adata = adata[:, adata.var.highly_variable]
+
+adata.var
+
+adata.X
+
+sc.pp.regress_out(adata, ['total_counts', 'pct_counts_mt'])
+
+sc.pp.scale(adata, max_value=10)
+
+sc.tl.pca(adata, svd_solver='arpack')
+
+sc.pl.pca(adata, color='FAP')
+
+sc.pl.pca_variance_ratio(adata, log=True)
+
+sc.pp.neighbors(adata, n_neighbors=10, n_pcs=27)
+
+sc.tl.umap(adata)
+
+
+
+sc.pl.umap(adata, color = 'sample')
+
+
+
+#implementation of leiden clusterization algorith (I personally prefer louvain)
+
+sc.tl.leiden(adata)
+
+sc.pl.umap(adata, color = 'leiden', add_outline=True, legend_loc='right margin',
+               legend_fontsize=12, legend_fontoutline=2, frameon=False,
+               palette='tab20')
+
+sc.pl.umap(adata, color = 'sample', add_outline=True, legend_loc='right margin',
+               legend_fontsize=12, legend_fontoutline=2, frameon=False,
+               palette='tab20')
+
+
+
+#ranking of genes for every cluster
+
+sc.settings.verbosity = 2
+
+sc.tl.rank_genes_groups(adata, 'leiden', method='wilcoxon')
+sc.pl.rank_genes_groups(adata, n_genes=25, sharey=False)
+
+
+
+
+
+#removing batch effect
+
+import harmonypy as hm
+
+ho = hm.run_harmony(adata.obsm['X_pca'], adata.obs, ['sample'])
+
+adata.obsm['X_harmony'] = ho.Z_corr.T
+
+sc.pp.neighbors(adata, use_rep='X_harmony')
+
+sc.tl.umap(adata)
+
+
+
+# plt.figure(figsize=(10,10))
+# plt.scatter(adata.obsm['X_umap'][:,0], adata.obsm['X_umap'][:,1], c=adata.obs['sample'], alpha=0.1, s=3)
+sc.pl.umap(adata, color=['sample'], palette='tab20')
+
+
+
+#clusterization after batch effect was removed
+
+sc.tl.leiden(adata)
+
+sc.settings.verbosity = 2  # reduce the verbosity
+
+sc.tl.rank_genes_groups(adata, 'leiden', method='wilcoxon')
+sc.pl.rank_genes_groups(adata, n_genes=25, sharey=False)
+
+
+
+
+
+marker_genes = ['HAVCR2', 'BTLA', 'TIGIT', 'LAG3', 'PDCD1', 'CTLA4', 'IL4', 'KLRC1']
+marker_genes = list(set(marker_genes))
+
+marker_genes_ep = ['EPCAM', 'YAP1', 'TAZ', 'ACTA2', 'MMP2', 'MMP9', 'MMP11']
+marker_genes_ep = list(set(marker_genes_ep))
+
+
+
+#mannual annotation of patients data
+
+sample_cancer_mapper = {'YZ-1': 'Aggressive',
+                        'YZ-10': 'Aggressive',
+                        'YZ-11': 'Indolent',
+                        'YZ-12': 'Indolent',
+                        'YZ-13': 'Aggressive',
+                        'YZ-14': 'Indolent',
+                        'YZ-15': 'Indolent',
+                        'YZ-16': 'Aggressive',
+                        'YZ-2': 'Aggressive',
+                        'YZ-3': 'Indolent',
+                        'YZ-4': 'Indolent',
+                        'YZ-5': 'Aggressive',
+                        'YZ-6': 'Indolent',
+                        'YZ-7': 'Indolent',
+                        'YZ-8': 'Indolent',
+                        'YZ-9': 'Aggressive'}
+
+adata.obs['cancer type'] = adata.obs['sample'].map(sample_cancer_mapper)
+
+
+
+with rc_context({'figure.figsize': (5, 5)}):
+    sc.pl.umap(adata, color = 'cancer type', edges_color = 'black', add_outline=True, legend_loc='right margin',
+               legend_fontsize=12, legend_fontoutline=2, frameon=False, palette = 'Set1')
+
+with rc_context({'figure.figsize': (5, 5)}):
+    sc.pl.umap(adata, color = 'sample', legend_loc='right margin',
+               legend_fontsize=12, legend_fontoutline=2, frameon=False, palette = 'tab20')
+
+
+
+
+
+list_samples = ['YZ-1',
+                'YZ-10',
+                'YZ-11',
+                'YZ-12',
+                'YZ-13',
+                'YZ-14',
+                'YZ-15',
+                'YZ-16',
+                'YZ-2',
+                'YZ-3', 
+                'YZ-4', 
+                'YZ-5',
+                'YZ-6', 
+                'YZ-7', 
+                'YZ-8',
+                'YZ-9']
+
+list_type = ['Aggressive',
+            'Aggressive',
+            'Indolent',
+            'Indolent',
+            'Aggressive',
+            'Indolent',
+            'Indolent',
+            'Aggressive',
+            'Aggressive',
+            'Indolent',
+            'Indolent',
+            'Aggressive',
+            'Indolent',
+            'Indolent',
+            'Indolent',
+            'Aggressive']
+
+sc.pl.umap(adata, color=['leiden'])
+
+with rc_context({'figure.figsize': (5, 5)}):
+    sc.pl.umap(adata, color = 'leiden', edges_color = 'black', add_outline=True, legend_loc='on data',
+               legend_fontsize=12, legend_fontoutline=2, frameon=False, palette = 'Set1')
+
+#annotation of cell types (markers are below)
+
+cluster2annotation = {
+     '0': 'CD4+ T-cells',
+     '1': 'B-cells',
+     '2': 'CD8+ T-cells',
+     '3': 'CD8+ T-cells',
+     '4': 'Plasma cells',
+     '5': 'CD4+ T-cells',
+     '6': 'CD4+ T-cells',
+     '7': 'CD4+ T-cells',
+     '8': 'CD8+ T-cells',
+     '9': 'Myeloid cells',
+     '10': 'Plasma cells',
+     '11': 'CD4+ T-cells',
+     '12': 'Stromal',
+     '13': 'NK cells',
+     '14': 'CD4+ T-cells',
+     '15': 'Endothelial',
+     '16': 'CD8+ T-cells',
+     '17': 'Stromal',
+     '18': 'Mast cells',
+     '19': 'Epithelial/Cancer',
+     '20': 'Plasma cells',
+     '21': 'CD4+ T-cells',
+    '22': 'CD4+ T-cells',
+    '23': 'Myeloid cells',
+    '24': 'Stromal',
+    '25': 'CD4+ T-cells',
+    '26': 'Stromal'
+}
+
+adata.obs['cell type'] = adata.obs['leiden'].map(cluster2annotation).astype('category')
+
+set(adata.obs['cell type'])
+
+sc.pl.umap(adata, color=['cell type'])
+
+sns.set()
+sns.set(style="ticks", context="talk")
+plt.style.use("fivethirtyeight")
+plt.rcParams['axes.facecolor'] = 'white'
+plt.rcParams['figure.facecolor'] = 'white'
+
+with rc_context({'figure.figsize': (5, 5)}):
+    sc.pl.umap(adata, color = 'cell type', edges_color = 'black', add_outline=True, legend_loc='right margin',
+               legend_fontsize=12, legend_fontoutline=2, frameon=True, palette = 'Paired')
+
+with rc_context({'figure.figsize': (5, 5)}):
+    sc.pl.umap(adata, color = 'cell type', edges_color = 'black', add_outline=True, legend_loc='right margine',
+               legend_fontsize=12, legend_fontoutline=2, frameon=True, palette = 'Paired')
+
+with rc_context({'figure.figsize': (5, 5)}):
+    sc.pl.umap(adata, color = 'sample', edges_color = 'black', add_outline=True, legend_loc='right margin',
+               legend_fontsize=12, legend_fontoutline=2, frameon=True, palette = "cubehelix")
+
+with rc_context({'figure.figsize': (5, 5)}):
+    sc.pl.umap(adata, color = 'cancer type', edges_color = 'black', add_outline=True, legend_loc='right margin',
+               legend_fontsize=12, legend_fontoutline=2, frameon=True, palette = 'Set1')
+
+
+
+
+
+
+
+#markers
+
+list_of_markers = ['CLDN5',
+                   'FLT1',
+                   'VWF',
+                   'PECAM1',
+                   'KDR',
+                   'CDH5',
+                   'ANGPT2',
+                   'ACKR1',
+                   'CAPS',
+                   'SNTN',
+                   'TFF3',
+                   'CDH1',
+                   'FOXJ1',
+                   'LUM',
+                   'COL1A1',
+                   'COL1A2',
+                   'DCN',
+                   'C1R',
+                   'LYZ',
+                   'CD14',
+                   'CD68',
+                   'FCGR1A',
+                   'FCGR3A',
+                   'MNDA',
+                   'CD2',
+                   'CD3D',
+                   'CD4',
+                   'CD8A',
+                   'TRAC',
+                   'NKG7',
+                   'GZMA',
+                   'CD79A',
+                   'IGLC3',
+                   'JCHAIN',
+                   'MZB1',
+                   'CLDN18',
+                   'AQP4',
+                   'FOLR1',
+                   'SFTPC',
+                   'ABCA3',
+                   'SFTPB',
+                   'SCGB3A1',
+                   'GATA2',
+                   'CPA3',
+                   'MS4A2',
+                   'TPSB2',
+                   'TPSAB1',
+                   'CSF3R',
+                   'CXCR2',
+                   'FCGR3B',
+                   'FDCSP',
+                   'EPCAM',
+                   'KRT18',
+                   'FGFR1',
+                   'TP63',
+                   'MYC',
+                   'SOX2']
+
+list_of_markers_2 = ['CLDN5',
+                   'FLT1',
+                   'VWF',
+                   'PECAM1',
+                   'KDR',
+                   'CDH5',
+                   'LUM',
+                   'COL1A1',
+                   'COL1A2',
+                   'DCN',
+                   'C1R',
+                   'LYZ',
+                   'CD14',
+                   'CD68',
+                   'FCGR1A',
+                   'FCGR3A',
+                   'MNDA',
+                   'CD2',
+                   'CD3D',
+                   'CD4',
+                   'CD8A',
+                   'TRAC',
+                   'NKG7',
+                   'GZMA',
+                   'CD79A',
+                   'IGLC3',
+                   'JCHAIN',
+                   'MZB1',
+                   'GATA2',
+                   'CPA3',
+                   'MS4A2',
+                   'TPSB2',
+                   'TPSAB1',
+                   'EPCAM',
+                   'KRT18',
+                   'FGFR1',
+                   'TP63',
+                   'MYC',
+                   'SOX2']
+
+
+
+#heatmap with clusterization using markers list
+
+ax = sc.pl.heatmap(adata, list_of_markers, groupby='cell type', vmin=-5, vmax=5, cmap='RdBu_r', swap_axes=True, figsize=(11,11), show_gene_labels=True)
+
+sc.pl.stacked_violin(adata, list_of_markers, groupby='cell type', cmap='bwr')
+
+sc.pl.dotplot(adata, list_of_markers_2, groupby='cell type', cmap='bwr', dendrogram= True)
